@@ -3,6 +3,8 @@ import cors from "cors";
 import dotenv from "dotenv";
 import bodyParser from "body-parser";
 import mongoose from "mongoose";
+import http from "http";
+import { Server } from "socket.io";
 import userroutes from "./routes/auth.js";
 import videoroutes from "./routes/video.js";
 import likeroutes from "./routes/like.js";
@@ -10,9 +12,11 @@ import watchlaterroutes from "./routes/watchlater.js";
 import historyrroutes from "./routes/history.js";
 import commentroutes from "./routes/comment.js";
 import subscriptionroutes from "./routes/subscription.js";
+import downloadroutes from "./routes/download.js";
 
 dotenv.config();
 const app = express();
+const server = http.createServer(app);
 import path from "path";
 import { sendmail } from "./mails/mails.js";
 app.use(cors());
@@ -46,9 +50,122 @@ app.use("/like", likeroutes);
 app.use("/watch", watchlaterroutes);
 app.use("/history", historyrroutes);
 app.use("/comment", commentroutes);
+app.use("/download", downloadroutes);
 const PORT = process.env.PORT || 5000;
 
-app.listen(PORT, () => {
+const io = new Server(server, {
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST"],
+  },
+});
+
+const userSocketMap = new Map();
+const pendingDisconnects = new Map();
+
+io.on("connection", (socket) => {
+  socket.on("call:register", ({ userId }) => {
+    if (!userId) return;
+    const pendingKey = `${userId}::${socket.data.roomId || ""}`;
+    if (pendingDisconnects.has(pendingKey)) {
+      clearTimeout(pendingDisconnects.get(pendingKey));
+      pendingDisconnects.delete(pendingKey);
+    }
+    socket.data.userId = userId;
+    userSocketMap.set(userId, socket.id);
+    socket.emit("call:registered", { userId });
+  });
+
+  socket.on("call:invite", ({ toUserId, fromUserId, roomId }) => {
+    if (!toUserId || !fromUserId || !roomId) return;
+    const targetSocketId = userSocketMap.get(toUserId);
+
+    if (!targetSocketId) {
+      socket.emit("call:invite-status", {
+        ok: false,
+        reason: "User is not available for call.",
+      });
+      return;
+    }
+
+    io.to(targetSocketId).emit("call:incoming", { roomId, fromUserId });
+    socket.emit("call:invite-status", { ok: true });
+  });
+
+  socket.on("call:reject", ({ toUserId, fromUserId }) => {
+    if (!toUserId || !fromUserId) return;
+    const targetSocketId = userSocketMap.get(toUserId);
+    if (targetSocketId) {
+      io.to(targetSocketId).emit("call:rejected", { fromUserId });
+    }
+  });
+
+  socket.on("call:accept", ({ toUserId, fromUserId, roomId }) => {
+    if (!toUserId || !fromUserId || !roomId) return;
+    const targetSocketId = userSocketMap.get(toUserId);
+    if (targetSocketId) {
+      io.to(targetSocketId).emit("call:accepted", { fromUserId, roomId });
+    }
+  });
+
+  socket.on("call:join", ({ roomId, userId }) => {
+    if (!roomId || !userId) return;
+    socket.data.roomId = roomId;
+    socket.data.userId = userId;
+    const pendingKey = `${userId}::${roomId}`;
+    if (pendingDisconnects.has(pendingKey)) {
+      clearTimeout(pendingDisconnects.get(pendingKey));
+      pendingDisconnects.delete(pendingKey);
+    }
+    socket.join(roomId);
+
+    const room = io.sockets.adapter.rooms.get(roomId);
+    const participantCount = room ? room.size : 1;
+    socket.emit("call:joined", { roomId, participantCount });
+    socket.to(roomId).emit("call:peer-joined", { userId });
+  });
+
+  socket.on("call:offer", ({ roomId, offer, fromUserId }) => {
+    socket.to(roomId).emit("call:offer", { offer, fromUserId });
+  });
+
+  socket.on("call:answer", ({ roomId, answer, fromUserId }) => {
+    socket.to(roomId).emit("call:answer", { answer, fromUserId });
+  });
+
+  socket.on("call:ice-candidate", ({ roomId, candidate, fromUserId }) => {
+    socket.to(roomId).emit("call:ice-candidate", { candidate, fromUserId });
+  });
+
+  socket.on("call:leave", ({ roomId, userId }) => {
+    if (!roomId) return;
+    socket.leave(roomId);
+    socket.to(roomId).emit("call:peer-left", { userId });
+  });
+
+  socket.on("disconnect", () => {
+    const disconnectedUserId = socket.data.userId;
+    const disconnectedRoomId = socket.data.roomId;
+
+    if (disconnectedUserId && userSocketMap.get(disconnectedUserId) === socket.id) {
+      userSocketMap.delete(disconnectedUserId);
+    }
+    if (!disconnectedUserId || !disconnectedRoomId) return;
+
+    const pendingKey = `${disconnectedUserId}::${disconnectedRoomId}`;
+    const timeout = setTimeout(() => {
+      pendingDisconnects.delete(pendingKey);
+      if (userSocketMap.has(disconnectedUserId)) return;
+      socket.to(disconnectedRoomId).emit("call:peer-left", {
+        userId: disconnectedUserId,
+      });
+    }, 5000);
+
+    pendingDisconnects.set(pendingKey, timeout);
+  });
+});
+
+server.listen(PORT, () => {
   console.log(`server running on port ${PORT}`);
 });
 

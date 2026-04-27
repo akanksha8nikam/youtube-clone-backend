@@ -17,15 +17,63 @@ import downloadroutes from "./routes/download.js";
 dotenv.config();
 const app = express();
 const server = http.createServer(app);
+import multer from "multer";
 import path from "path";
+import fs from "fs";
+import { fileURLToPath } from "url";
+import { uploadsDir } from "./filehelper/filehelper.js";
+
+// Ensure uploads directory exists for production
+const resolvedUploadsDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), uploadsDir);
+if (!fs.existsSync(resolvedUploadsDir)) {
+  fs.mkdirSync(resolvedUploadsDir, { recursive: true });
+  console.log("Created uploads directory at:", resolvedUploadsDir);
+}
 import { sendmail } from "./mails/mails.js";
-app.use(cors());
+
+// Robust CORS for production media streaming
+app.use(cors({
+  origin: "*",
+  methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization", "Range"],
+  exposedHeaders: ["Content-Range", "Content-Length", "Accept-Ranges"],
+  credentials: true
+}));
+
 app.use(express.json({ limit: "30mb", extended: true }));
 app.use(express.urlencoded({ limit: "30mb", extended: true }));
-app.use("/uploads", express.static(path.join("uploads")));
+
+// Serve static files with explicit headers for video streaming
+app.use("/uploads", (req, res, next) => {
+  console.log(`[Static] Request for: ${req.url}`);
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Range");
+  res.header("Access-Control-Expose-Headers", "Content-Range, Content-Length, Accept-Ranges");
+  next();
+}, express.static(resolvedUploadsDir));
 app.use("/subscription", subscriptionroutes);
 app.get("/", (req, res) => {
   res.send("You tube backend is working");
+});
+
+app.get("/api/health", async (req, res) => {
+  const status = {
+    uptime: process.uptime(),
+    timestamp: Date.now(),
+    db: mongoose.connection.readyState === 1 ? "Connected" : "Disconnected",
+    cloudinary: "Checking...",
+  };
+
+  try {
+    const { default: cloudinaryInstance } = await import("./config/cloudinary.js");
+    await cloudinaryInstance.api.ping();
+    status.cloudinary = "Connected";
+    res.status(200).json(status);
+  } catch (err) {
+    status.cloudinary = `Error: ${err.message}`;
+    res.status(500).json(status);
+  }
 });
 
 app.post("/api/send-mail", async (req, res) => {
@@ -188,3 +236,15 @@ mongoose
   .catch((error) => {
     console.log(error);
   });
+
+// Global Error Handler
+app.use((err, req, res, next) => {
+  console.error("!!! GLOBAL SERVER ERROR !!!");
+  console.error("Message:", err.message);
+  console.error("Stack:", err.stack);
+  res.status(500).json({ 
+    message: "Internal Server Error", 
+    error: err.message,
+    stack: process.env.NODE_ENV === 'development' ? err.stack : undefined
+  });
+});

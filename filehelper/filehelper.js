@@ -1,16 +1,16 @@
 "use strict";
 import multer from "multer";
-const storage = multer.diskStorage({
-  destination: (req, res, cb) => {
-    cb(null, "uploads");
-  },
-  filename: (req, file, cb) => {
-    cb(
-      null,
-      new Date().toISOString().replace(/:/g, "-") + "-" + file.originalname
-    );
+import { CloudinaryStorage } from "multer-storage-cloudinary";
+import cloudinary from "../config/cloudinary.js";
+
+const storage = new CloudinaryStorage({
+  cloudinary: cloudinary,
+  params: {
+    folder: "youtube_clone/videos",
+    resource_type: "auto",
   },
 });
+
 const filefilter = (req, file, cb) => {
   if (file.mimetype && file.mimetype.startsWith("video/")) {
     cb(null, true);
@@ -18,5 +18,14 @@ const filefilter = (req, file, cb) => {
     cb(null, false);
   }
 };
-const upload = multer({ storage: storage, fileFilter: filefilter });
+
+const upload = multer({ 
+  storage: storage, 
+  fileFilter: filefilter,
+  limits: {
+    fieldSize: 20 * 1024 * 1024, // 20 MB for large base64 thumbnails
+  }
+});
+
+export const uploadsDir = "uploads";
 export default upload;

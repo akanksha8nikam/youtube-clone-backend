@@ -4,27 +4,50 @@ import mongoose from "mongoose";
 
 export const uploadvideo = async (req, res) => {
   if (req.file === undefined) {
+    console.warn("Upload blocked: Request file is undefined. MIME type check might have failed.");
     return res
       .status(404)
       .json({ message: "plz upload a mp4 video file only" });
   } else {
     try {
+      console.log("--- UPLOAD DEBUG START ---");
+      console.log("File detected:", req.file ? "YES" : "NO");
+      if (req.file) {
+        console.log("Path:", req.file.path);
+        console.log("Type:", req.file.mimetype);
+        console.log("Size:", req.file.size);
+      }
+      console.log("Body metadata:", {
+        videotitle: req.body.videotitle,
+        videochanel: req.body.videochanel,
+        uploader: req.body.uploader,
+        hasThumbnail: !!req.body.thumbnail,
+        duration: req.body.duration
+      });
+
       const file = new video({
         videotitle: req.body.videotitle,
         filename: req.file.originalname,
-        filepath: req.file.path,
+        filepath: req.file.path, // Cloudinary URL
         filetype: req.file.mimetype,
-        filesize: req.file.size,
+        filesize: String(req.file.size),
         videochanel: req.body.videochanel,
         uploader: req.body.uploader,
         thumbnail: req.body.thumbnail,
         duration: req.body.duration,
+        description: req.body.description,
       });
+
+      console.log("Attempting to save to MongoDB...");
       await file.save();
+      console.log("Successfully saved video metadata to DB");
+      console.log("--- UPLOAD DEBUG END ---");
       return res.status(201).json("file uploaded successfully");
     } catch (error) {
-      console.error(" error:", error);
-      return res.status(500).json({ message: "Something went wrong" });
+      console.error("!!! UPLOAD FATAL ERROR !!!");
+      console.error("Error Message:", error.message);
+      console.error("Stack Trace:", error.stack);
+      return res.status(500).json({ message: error.message || "Something went wrong" });
     }
   }
 };
@@ -65,7 +88,9 @@ export const deletevideo = async (req, res) => {
 
 export const updatevideo = async (req, res) => {
   const { id } = req.params;
-  const { videotitle, uploader } = req.body;
+  const { videotitle, description, uploader, duration } = req.body;
+
+  console.log("Update Video Request:", { id, videotitle, hasDescription: !!description, uploader });
 
   if (!mongoose.Types.ObjectId.isValid(id)) {
     return res.status(404).json({ message: "Video unavailable..." });
@@ -75,16 +100,26 @@ export const updatevideo = async (req, res) => {
     const videoFile = await video.findById(id);
     if (!videoFile) return res.status(404).json({ message: "Video not found" });
 
+    // Ensure uploader permission
     if (uploader && String(videoFile.uploader) !== String(uploader)) {
+      console.warn("Update blocked: Unauthorized user", { uploader, originalUploader: videoFile.uploader });
       return res.status(403).json({ message: "Not allowed to update this video" });
     }
 
+    const updateData = {};
+    if (videotitle !== undefined) updateData.videotitle = videotitle;
+    if (description !== undefined) updateData.description = description;
+    if (duration !== undefined) updateData.duration = duration;
+
+    console.log("Applying Update:", updateData);
+
     const updatedVideo = await video.findByIdAndUpdate(
       id,
-      { $set: { videotitle: videotitle, duration: req.body.duration } },
+      { $set: updateData },
       { new: true }
     );
     
+    console.log("Update successful");
     return res.status(200).json(updatedVideo);
   } catch (error) {
     console.error("Update video error:", error);

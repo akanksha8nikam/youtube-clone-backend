@@ -1,6 +1,8 @@
 import users from "../Modals/Auth.js";
 import mongoose from "mongoose";
 import { sendSubscriptionInvoiceEmail } from "../mails/mails.js";
+import razorpayInstance from "../config/razorpay.js";
+import crypto from "crypto";
 
 const PLAN_CONFIG = {
     FREE: { name: "FREE", price: 0, maxMinutes: 5 },
@@ -35,19 +37,34 @@ export const getUserSubscription = async (req, res) => {
         const user = await users.findById(userId);
         if (!user) return res.status(404).json({ message: "User not found" });
 
-        // Lazy reset: Check if the last reset was on a previous day
+        // Lazy reset: Check if the last reset was on a previous day (IST Timezone)
         const now = new Date();
         const lastReset = new Date(user.lastWatchTimeReset || Date.now());
-        
-        const isDifferentDay = 
-            now.getFullYear() !== lastReset.getFullYear() ||
-            now.getMonth() !== lastReset.getMonth() ||
-            now.getDate() !== lastReset.getDate();
+
+        // Robust IST Day Calculator (+5:30 offset)
+        const getISTDayIdentifier = (date) => {
+            const d = new Date(date);
+            // shift UTC to IST manually
+            const istTime = d.getTime() + (5.5 * 60 * 60 * 1000);
+            const istDate = new Date(istTime);
+            return `${istDate.getUTCFullYear()}-${istDate.getUTCMonth()}-${istDate.getUTCDate()}`;
+        };
+
+        const todayIST = getISTDayIdentifier(now);
+        const lastResetIST = getISTDayIdentifier(lastReset);
+        const isDifferentDay = todayIST !== lastResetIST;
+
+        console.log(`[Subscription Debug] User: ${user.email}`);
+        console.log(`[Subscription Debug] Today (IST): ${todayIST}, Last Reset (IST): ${lastResetIST}`);
+        console.log(`[Subscription Debug] Is Different Day: ${isDifferentDay}`);
 
         if (isDifferentDay) {
+            console.log(`[Subscription Action] Triggering Reset to FREE for ${user.email}`);
             user.consumedWatchTime = 0;
+            user.subscriptionPlan = "FREE";
             user.lastWatchTimeReset = now;
             await user.save();
+            console.log(`[Subscription Action] Reset successful for ${user.email}`);
         }
 
         const rawPlanKey = user.subscriptionPlan || "FREE";
@@ -174,7 +191,8 @@ export const changeSubscription = async (req, res) => {
         );
 
         if (updatedUser?.email) {
-            await sendSubscriptionInvoiceEmail({
+            // Attempt to send email, but don't block the response OR fail the transaction if it fails
+            sendSubscriptionInvoiceEmail({
                 to: updatedUser.email,
                 username: updatedUser.name || "User",
                 planName: selectedPlan.name,
@@ -182,6 +200,8 @@ export const changeSubscription = async (req, res) => {
                 watchLimit,
                 invoiceId,
                 paymentDate,
+            }).catch(err => {
+                console.error("[Email Error] Failed to send subscription invoice:", err.message);
             });
         }
 
@@ -202,3 +222,62 @@ export const changeSubscription = async (req, res) => {
         return res.status(500).json({ message: "Something went wrong" });
     }
 };
+
+export const createOrder = async (req, res) => {
+    const { amount, currency = "INR", receipt } = req.body;
+
+    try {
+        if (!process.env.RAZORPAY_KEY_ID || !process.env.RAZORPAY_KEY_SECRET) {
+            console.error("CRITICAL: Razorpay keys missing in server/.env");
+            return res.status(500).json({ message: "Server configuration error: Missing Payment Keys" });
+        }
+
+        const options = {
+            amount: amount * 100, // Razorpay expects amount in paise
+            currency,
+            receipt: receipt || `receipt_${Date.now()}`,
+        };
+
+        const order = await razorpayInstance.orders.create(options);
+        return res.status(200).json(order);
+    } catch (error) {
+        console.error("Razorpay create order error details:", error);
+        const razorpayError = error.error?.description || error.message || "Failed to create order";
+        return res.status(500).json({ message: razorpayError });
+    }
+};
+
+export const verifyPayment = async (req, res) => {
+    const { 
+        userId, 
+        plan, 
+        razorpay_order_id, 
+        razorpay_payment_id, 
+        razorpay_signature 
+    } = req.body;
+
+    try {
+        // 1. Verify Signature
+        const body = razorpay_order_id + "|" + razorpay_payment_id;
+        const expectedSignature = crypto
+            .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
+            .update(body.toString())
+            .digest("hex");
+
+        const isAuthentic = expectedSignature === razorpay_signature;
+
+        if (!isAuthentic) {
+            return res.status(400).json({ message: "Payment verification failed" });
+        }
+
+        // 2. Signature is authentic, now update subscription
+        req.body.paymentStatus = "PAID";
+        req.body.paymentReference = razorpay_payment_id;
+        
+        return changeSubscription(req, res);
+
+    } catch (error) {
+        console.error("Razorpay verification error:", error);
+        return res.status(500).json({ message: "Something went wrong during verification" });
+    }
+};
